@@ -5125,12 +5125,17 @@ class AIAgent:
                     "http://": _httpx.HTTPTransport(verify=verify),
                     "https://": _httpx.HTTPTransport(verify=verify),
                 }
+            from agent.control_capability import httpx_request_hook
+
             return _httpx.Client(
                 limits=_limits,
                 timeout=_timeout,
                 proxy=_proxy,
                 mounts=_mounts or None,
                 verify=verify,
+                # See agent/control_capability: a hook rather than a default
+                # header, because this client is shared across turns.
+                event_hooks={"request": [httpx_request_hook()]},
             )
         except Exception:
             return None
