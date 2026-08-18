@@ -182,8 +182,20 @@ def build_keepalive_http_client(
         # Generous read=None for SSE streaming endpoints.
         timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)
 
+        from agent.control_capability import (
+            async_httpx_request_hook,
+            httpx_request_hook,
+        )
+
         transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
         client_cls = httpx.AsyncClient if async_mode else httpx.Client
+        # A request hook, not a default header: this client outlives a turn, so
+        # a default header would pin one turn's capability to every later
+        # request. The hook reads the ContextVar at send time and therefore
+        # sees the capability of whichever turn is making the call.
+        event_hooks = {
+            "request": [async_httpx_request_hook() if async_mode else httpx_request_hook()]
+        }
         mounts = {}
         if proxy is None:
             mounts = {
@@ -196,6 +208,7 @@ def build_keepalive_http_client(
             proxy=proxy,
             mounts=mounts or None,
             verify=verify,
+            event_hooks=event_hooks,
         )
     except Exception:
         return None

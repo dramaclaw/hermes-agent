@@ -11,6 +11,12 @@ import logging
 import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+
+from agent.control_capability import (
+    bind_capability as bind_control_capability,
+    clear_capability as clear_control_capability,
+    parse_capability as parse_control_capability,
+)
 from pathlib import Path
 from typing import Any, Deque, Optional
 from urllib.parse import unquote, urlparse
@@ -1643,6 +1649,12 @@ class HermesACPAgent(acp.Agent):
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
 
+        # Host-issued, per-turn egress capability (see agent/control_capability).
+        # Read here and bound inside _run_agent below, which executes in this
+        # turn's own contextvars.copy_context(); binding it anywhere shared
+        # would leak it across concurrent turns on the executor.
+        turn_capability = parse_control_capability(kwargs.get("_meta") or kwargs.get("meta"))
+
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
@@ -1850,6 +1862,9 @@ class HermesACPAgent(acp.Agent):
 
         def _run_agent() -> dict:
             nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
+            # Scoped to this turn only, and released unconditionally below so a
+            # later turn on the same executor thread cannot inherit it.
+            capability_token = bind_control_capability(turn_capability)
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -1942,6 +1957,13 @@ class HermesACPAgent(acp.Agent):
                         clear_session_vars(session_tokens)
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
+                # Unconditional: this thread is reused, so a capability left
+                # bound here would be inherited by the next turn scheduled onto
+                # it and attached to a request it does not belong to.
+                try:
+                    clear_control_capability(capability_token)
+                except Exception:
+                    logger.debug("Could not clear the egress control capability", exc_info=True)
 
         try:
             # Snapshot the internal Hermes DB session id before the turn so we
