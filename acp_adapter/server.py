@@ -605,6 +605,34 @@ def _content_blocks_to_openai_user_content(
     return parts
 
 
+def _recover_turn_meta(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Recover the ACP ``_meta`` mapping for this turn.
+
+    The router does not hand ``_meta`` to the handler as a mapping. It parses it
+    into ``field_meta``, drops that name, and splats the mapping's own keys into
+    the handler's keyword arguments:
+
+        params = {k: getattr(model_obj, k) for k in model.model_fields
+                  if k != "field_meta"}
+        if meta := getattr(model_obj, "field_meta", None):
+            params.update(meta)
+
+    So a handler reading ``kwargs["_meta"]`` sees nothing, and every extension
+    riding on ``_meta`` silently disappears — which is exactly what happened to
+    the per-turn credential and capability: sent by the host, dropped here, and
+    reported only as an unrelated-looking connection error three retries later.
+
+    The direct lookup is kept first so a router version that does pass ``_meta``
+    as a mapping keeps working. Extension keys are namespaced with a dot by ACP
+    convention, and a dot cannot appear in a Python parameter name, so a dotted
+    key in kwargs can only have come from the splat.
+    """
+    direct = kwargs.get("_meta") or kwargs.get("meta")
+    if isinstance(direct, dict):
+        return direct
+    return {key: value for key, value in kwargs.items() if "." in key}
+
+
 class HermesACPAgent(acp.Agent):
     """ACP Agent implementation wrapping Hermes AIAgent."""
 
@@ -1813,13 +1841,22 @@ class HermesACPAgent(acp.Agent):
         # Read here and bound inside _run_agent below, which executes in this
         # turn's own contextvars.copy_context(); binding it anywhere shared
         # would leak it across concurrent turns on the executor.
-        turn_meta = kwargs.get("_meta") or kwargs.get("meta")
+        turn_meta = _recover_turn_meta(kwargs)
         turn_capability = parse_control_capability(turn_meta)
         # Authentication for this turn, on the opposite failure semantics from
         # the capability above: a missing capability costs a data point, a
         # missing credential must stop the request rather than bill the wrong
         # account.
         turn_credential, credential_required = parse_gateway_credential(turn_meta)
+        # Presence only, never values. The capability is fail-open by design, so
+        # without this line a host that silently stops delivering it looks
+        # identical to one that never sent it — the evidence plane goes quiet
+        # and nothing anywhere reports why.
+        logger.info(
+            "acp turn identity: meta=%s capability=%s credential=%s required=%s",
+            bool(turn_meta), bool(turn_capability),
+            bool(turn_credential), credential_required,
+        )
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
