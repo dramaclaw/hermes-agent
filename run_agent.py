@@ -5092,6 +5092,7 @@ class AIAgent:
                     "https://": _httpx.HTTPTransport(verify=verify),
                 }
             from agent.control_capability import httpx_request_hook
+            from agent.gateway_credential import httpx_request_hook as credential_hook
 
             return _httpx.Client(
                 limits=_limits,
@@ -5101,7 +5102,7 @@ class AIAgent:
                 verify=verify,
                 # See agent/control_capability: a hook rather than a default
                 # header, because this client is shared across turns.
-                event_hooks={"request": [httpx_request_hook()]},
+                event_hooks={"request": [httpx_request_hook(), credential_hook()]},
             )
         except Exception:
             return None

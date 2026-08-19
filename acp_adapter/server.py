@@ -17,6 +17,10 @@ from agent.control_capability import (
     clear_capability as clear_control_capability,
     parse_capability as parse_control_capability,
 )
+from agent.gateway_credential import (
+    bound_credential as bound_gateway_credential,
+    parse_credential as parse_gateway_credential,
+)
 from pathlib import Path
 from typing import Any, Deque, Optional
 from urllib.parse import unquote, urlparse
@@ -1653,7 +1657,13 @@ class HermesACPAgent(acp.Agent):
         # Read here and bound inside _run_agent below, which executes in this
         # turn's own contextvars.copy_context(); binding it anywhere shared
         # would leak it across concurrent turns on the executor.
-        turn_capability = parse_control_capability(kwargs.get("_meta") or kwargs.get("meta"))
+        turn_meta = kwargs.get("_meta") or kwargs.get("meta")
+        turn_capability = parse_control_capability(turn_meta)
+        # Authentication for this turn, on the opposite failure semantics from
+        # the capability above: a missing capability costs a data point, a
+        # missing credential must stop the request rather than bill the wrong
+        # account.
+        turn_credential, credential_required = parse_gateway_credential(turn_meta)
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
@@ -1865,6 +1875,8 @@ class HermesACPAgent(acp.Agent):
             # Scoped to this turn only, and released unconditionally below so a
             # later turn on the same executor thread cannot inherit it.
             capability_token = bind_control_capability(turn_capability)
+            credential_scope = bound_gateway_credential(turn_credential, credential_required)
+            credential_scope.__enter__()
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -1975,6 +1987,12 @@ class HermesACPAgent(acp.Agent):
                     clear_control_capability(capability_token)
                 except Exception:
                     logger.debug("Could not clear the egress control capability", exc_info=True)
+                # Unconditional, for the same reason: this thread is reused and
+                # the next turn on it must not inherit a credential.
+                try:
+                    credential_scope.__exit__(None, None, None)
+                except Exception:
+                    logger.debug("Could not clear the gateway credential", exc_info=True)
 
         try:
             # Snapshot the internal Hermes DB session id before the turn so we
