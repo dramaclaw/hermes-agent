@@ -36,6 +36,11 @@ CREDENTIAL_REQUIRED_META_KEY = "dramaclaw.gateway_api_key_required"
 
 MAX_CREDENTIAL_LENGTH = 4096
 
+#: Process-level latch. A host that multiplexes tenants sets this on the workers
+#: it starts; plain Hermes leaves it unset and keeps its existing behaviour.
+CREDENTIAL_MODE_ENV = "DRAMACLAW_GATEWAY_CREDENTIAL_MODE"
+PER_TURN_REQUIRED = "per_turn_required"
+
 _credential: ContextVar[Optional[str]] = ContextVar(
     "hermes_gateway_credential", default=None)
 _required: ContextVar[bool] = ContextVar(
@@ -65,7 +70,11 @@ def parse_credential(meta: Any) -> tuple[Optional[str], bool]:
     value = meta.get(CREDENTIAL_META_KEY)
     if not isinstance(value, str):
         return None, required
-    value = value.strip()
+    # Not stripped: silently repairing a malformed credential turns an illegal
+    # input into a legal-looking one, and " sk-abc" is not the key the host
+    # meant to send. Refuse it and let the latch below decide what that costs.
+    if value != value.strip():
+        return None, required
     if not value or len(value) > MAX_CREDENTIAL_LENGTH:
         return None, required
     if not value.isascii():
@@ -103,6 +112,21 @@ def _origin(url: str) -> Optional[tuple[str, str]]:
     return parts.scheme.lower(), parts.netloc.lower()
 
 
+def per_turn_credential_required() -> bool:
+    """Whether this process refuses to authenticate from its environment.
+
+    The per-turn ``required`` flag only covers "the field was there and the value
+    was broken". It cannot cover the case that actually matters: a caller,
+    retry path or older client that omits ``_meta`` entirely. Without a latch
+    that request falls through to whatever key the worker was started with,
+    which is precisely the cross-tenant billing and permission failure the
+    per-turn credential exists to remove.
+
+    So the decision is made once, for the process, by whoever started it.
+    """
+    return os.environ.get(CREDENTIAL_MODE_ENV, "").strip().lower() == PER_TURN_REQUIRED
+
+
 def targets_model_endpoint(request_url: str) -> bool:
     """True only for the configured model endpoint.
 
@@ -127,9 +151,11 @@ def apply_to_headers(headers: Any, request_url: str) -> bool:
     if credential:
         headers["Authorization"] = f"Bearer {credential}"
         return True
-    if credential_is_required():
+    if credential_is_required() or per_turn_credential_required():
+        # Whatever the client already carries is a placeholder that exists to
+        # let the SDK initialise. It must never authenticate a request.
         raise MissingGatewayCredential(
-            "this turn requires a per-turn gateway credential and none is usable; "
+            "this worker authenticates per turn and no usable credential is bound; "
             "refusing to fall back to the process credential")
     return False
 
