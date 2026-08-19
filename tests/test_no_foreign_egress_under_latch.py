@@ -124,3 +124,45 @@ def test_the_auxiliary_chain_is_unchanged_without_the_latch(monkeypatch):
 
     labels = [label for label, _ in auxiliary_client._get_provider_chain()]
     assert "openrouter" in labels and "nous" in labels
+
+
+# -- non-regression: a customer's own gateway is its own gateway -------------
+#
+# The confinement rule is "only the configured gateway", not "only BrainClaw's".
+# Every worker DramaClaw launches now carries the latch, including on
+# deployments that have never heard of BrainClaw, so a self-hosted or BYO
+# customer reaches its own endpoint through exactly this path.
+
+BYO = "https://llm.customer.example"
+
+
+@pytest.fixture
+def byo_latched(monkeypatch):
+    monkeypatch.setenv("DRAMACLAW_GATEWAY_CREDENTIAL_MODE", "per_turn_required")
+    monkeypatch.setenv("NEWAPI_BASE_URL", BYO)
+
+
+def test_a_byo_endpoint_is_reachable_under_the_latch(byo_latched):
+    refuse_foreign_endpoint(f"{BYO}/v1/chat/completions")
+
+
+def test_a_byo_endpoint_on_a_nonstandard_port_is_reachable(monkeypatch):
+    monkeypatch.setenv("DRAMACLAW_GATEWAY_CREDENTIAL_MODE", "per_turn_required")
+    monkeypatch.setenv("NEWAPI_BASE_URL", "http://newapi.internal:13000")
+    refuse_foreign_endpoint("http://newapi.internal:13000/v1/chat/completions")
+
+
+def test_a_byo_deployment_still_refuses_a_vendor(byo_latched):
+    """The protection is not weakened for self-hosted users, only aimed."""
+    with pytest.raises(ForeignModelEndpoint):
+        refuse_foreign_endpoint("https://openrouter.ai/api/v1/chat/completions")
+
+
+def test_a_path_or_query_difference_does_not_make_a_host_foreign(byo_latched):
+    """Origin comparison, not string comparison.
+
+    Hermes calls several paths on its gateway — completions, models, usage — so
+    comparing anything but the origin would refuse the deployment's own traffic.
+    """
+    for path in ("/v1/models", "/v1/chat/completions?stream=true", "/v1/embeddings"):
+        refuse_foreign_endpoint(f"{BYO}{path}")
