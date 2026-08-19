@@ -2067,9 +2067,16 @@ class HermesACPAgent(acp.Agent):
             nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
             # Scoped to this turn only, and released unconditionally below so a
             # later turn on the same executor thread cannot inherit it.
-            capability_token = bind_control_capability(turn_capability)
-            credential_scope = bound_gateway_credential(turn_credential, credential_required)
-            credential_scope.__enter__()
+            # Bound here, released in the finally at the end of this function.
+            # Everything between the two must be reachable by that finally: a
+            # turn that raised in between would leave its capability and
+            # credential bound on a pooled executor thread, where the next turn
+            # scheduled onto that thread would inherit them and attach them to
+            # a request they do not belong to. Nothing would fail at the time —
+            # the leak is only visible to the following turn, as the wrong
+            # identity on a request that otherwise succeeds.
+            capability_token = None
+            credential_scope = None
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -2136,6 +2143,10 @@ class HermesACPAgent(acp.Agent):
 
             agent._on_session_title = _notify_title_update
             try:
+                capability_token = bind_control_capability(turn_capability)
+                credential_scope = bound_gateway_credential(
+                    turn_credential, credential_required)
+                credential_scope.__enter__()
                 result = agent.run_conversation(
                     user_message=user_content,
                     conversation_history=state.history,
@@ -2176,16 +2187,23 @@ class HermesACPAgent(acp.Agent):
                 # Unconditional: this thread is reused, so a capability left
                 # bound here would be inherited by the next turn scheduled onto
                 # it and attached to a request it does not belong to.
-                try:
-                    clear_control_capability(capability_token)
-                except Exception:
-                    logger.debug("Could not clear the egress control capability", exc_info=True)
+                # Guarded on the sentinel: binding is now the first statement
+                # inside the try, so a failure there reaches this finally with
+                # nothing yet bound, and calling clear with None would raise
+                # inside cleanup and skip the credential release below it.
+                if capability_token is not None:
+                    try:
+                        clear_control_capability(capability_token)
+                    except Exception:
+                        logger.debug("Could not clear the egress control capability",
+                                     exc_info=True)
                 # Unconditional, for the same reason: this thread is reused and
                 # the next turn on it must not inherit a credential.
-                try:
-                    credential_scope.__exit__(None, None, None)
-                except Exception:
-                    logger.debug("Could not clear the gateway credential", exc_info=True)
+                if credential_scope is not None:
+                    try:
+                        credential_scope.__exit__(None, None, None)
+                    except Exception:
+                        logger.debug("Could not clear the gateway credential", exc_info=True)
 
         try:
             # Snapshot the internal Hermes DB session id before the turn so we
