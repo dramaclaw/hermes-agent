@@ -1,4 +1,11 @@
-"""Per-turn egress capability: isolation, validation and blast radius."""
+"""Per-turn egress capability: isolation, validation and blast radius.
+
+Scope note: the concurrency tests here cover the ACP executor layer only. They
+show that two ACP turns do not see each other's ContextVars; they do NOT show
+that the thread issuing the model call sees anything, because that call is
+handed to a separate thread inside `chat_completion_helpers`. Whole-chain
+propagation is covered by tests/test_egress_thread_sees_turn_identity.py.
+"""
 
 from __future__ import annotations
 
