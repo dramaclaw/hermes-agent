@@ -164,3 +164,65 @@ def test_a_cancelled_turn_releases_the_identity():
         with bound_credential("sk-turn", True), bound_capability("cap-turn"):
             raise Cancelled()
     assert _read_from_a_worker_thread() == (None, None)
+
+
+# -- the release must be reachable from wherever the turn fails --------------
+
+def test_the_binding_is_the_first_statement_inside_the_guarded_try():
+    """A turn that raises before the guarded region leaks its identity.
+
+    `_run_agent` binds the capability and the credential and releases them in
+    a `finally`. Between those two points sat forty-eight lines of setup —
+    session context, approval callbacks, an environment write — and anything
+    raising there would have left both bound on a pooled executor thread. The
+    next turn scheduled onto that thread would inherit them and attach them to
+    a request they do not belong to.
+
+    Nothing would fail at the time. The leak is visible only to the turn after,
+    as the wrong identity on a request that otherwise succeeds, which is why
+    this is asserted structurally rather than left to a runtime test.
+    """
+    import ast
+    import pathlib
+
+    import acp_adapter.server as server
+
+    tree = ast.parse(pathlib.Path(server.__file__).read_text())
+    run_agent = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_agent")
+
+    guarded = [node for node in run_agent.body
+               if isinstance(node, ast.Try) and node.finalbody]
+    assert len(guarded) == 1, "expected exactly one try/finally in _run_agent"
+
+    source = ast.get_source_segment(
+        pathlib.Path(server.__file__).read_text(), guarded[0].body[0]) or ""
+    assert "bind_control_capability" in source, (
+        "the capability must be bound inside the guarded region; bound earlier, "
+        "a failure in the setup between would skip the release entirely")
+
+
+def test_nothing_binds_an_identity_outside_the_guarded_region():
+    """The complement: no bind may appear before the try that releases it."""
+    import ast
+    import pathlib
+
+    import acp_adapter.server as server
+
+    text = pathlib.Path(server.__file__).read_text()
+    tree = ast.parse(text)
+    run_agent = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_agent")
+    guarded = next(node for node in run_agent.body
+                   if isinstance(node, ast.Try) and node.finalbody)
+
+    for statement in run_agent.body:
+        if statement is guarded:
+            break
+        segment = ast.get_source_segment(text, statement) or ""
+        for call in ("bind_control_capability", "bound_gateway_credential("):
+            assert call not in segment or "= None" in segment, (
+                f"{call} appears at line {statement.lineno}, outside the region "
+                f"the finally can reach")
