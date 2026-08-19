@@ -10,8 +10,8 @@ from __future__ import annotations
 import pytest
 
 from agent.gateway_credential import (
-    ForeignModelEndpoint, async_httpx_request_hook, httpx_request_hook,
-    refuse_foreign_endpoint,
+    ForeignModelEndpoint, GatewayConfigurationError, async_httpx_request_hook,
+    httpx_request_hook, refuse_foreign_endpoint,
 )
 
 GATEWAY = "https://gateway.example"
@@ -45,8 +45,37 @@ def test_the_configured_gateway_is_allowed(latched):
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1:19052", "localhost:8080", "[::1]:9000"])
-def test_loopback_is_allowed_for_local_tools_and_test_doubles(latched, host):
-    refuse_foreign_endpoint(f"http://{host}/v1/chat/completions")
+def test_a_loopback_host_that_is_not_the_gateway_is_refused(latched, host):
+    """Loopback is not a licence. Another local listener is still not ours.
+
+    A canary gateway is loopback, but so is a proxy, a second service, or a
+    developer's tunnel. Same-origin already admits the canary, so a blanket
+    loopback exception gave away the rule and bought nothing.
+    """
+    with pytest.raises(ForeignModelEndpoint):
+        refuse_foreign_endpoint(f"http://{host}/v1/chat/completions")
+
+
+def test_a_loopback_gateway_is_allowed_when_it_is_the_configured_one(monkeypatch):
+    """Which is how the canary itself passes."""
+    monkeypatch.setenv("DRAMACLAW_GATEWAY_CREDENTIAL_MODE", "per_turn_required")
+    monkeypatch.setenv("NEWAPI_BASE_URL", "http://127.0.0.1:19052")
+    refuse_foreign_endpoint("http://127.0.0.1:19052/v1/chat/completions")
+
+
+@pytest.mark.parametrize("value", ["", "   ", "not a url", "://broken"])
+def test_a_missing_or_unusable_gateway_refuses_everything(monkeypatch, value):
+    """An unset gateway is not permission to reach anywhere.
+
+    This was inverted: a worker that did not know where its gateway was passed
+    every destination, so the rule vanished exactly when it was needed.
+    """
+    monkeypatch.setenv("DRAMACLAW_GATEWAY_CREDENTIAL_MODE", "per_turn_required")
+    monkeypatch.setenv("NEWAPI_BASE_URL", value)
+    with pytest.raises(GatewayConfigurationError):
+        refuse_foreign_endpoint("https://openrouter.ai/api/v1/chat/completions")
+    with pytest.raises(GatewayConfigurationError):
+        refuse_foreign_endpoint("http://127.0.0.1:19052/v1/chat/completions")
 
 
 def test_without_the_latch_nothing_is_refused(monkeypatch):
