@@ -188,10 +188,8 @@ def async_httpx_request_hook():
     return _hook
 
 
-#: Hosts a per-turn worker may still reach: its own gateway, and loopback for a
-#: local tool or a test double. Everything else is refused before the body is
-#: written, because an unauthenticated request has still disclosed the prompt.
-_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+class GatewayConfigurationError(RuntimeError):
+    """A per-turn worker has no configured gateway to send anything to."""
 
 
 def refuse_foreign_endpoint(request_url: str) -> None:
@@ -200,22 +198,31 @@ def refuse_foreign_endpoint(request_url: str) -> None:
     Confining the auxiliary fallback chain is the fix; this is the backstop for
     it. The chain is one of several places that can pick a destination, and the
     property being defended — this turn's prompt never leaves for a host the
-    operator did not authorise — should not depend on every one of them being
-    found. Refusing here is failure-closed at the last point where the request
-    still has not gone out.
+    operator did not authorise — must not depend on every one of them being
+    found. This is the last point at which the request still has not gone out.
+
+    Two earlier escape hatches are gone, because each one was a way for the
+    property to be false while this function returned:
+
+    A missing or unparseable ``NEWAPI_BASE_URL`` used to pass everything. That
+    inverted the rule exactly when it mattered — a worker that does not know
+    where its gateway is has no destination it can justify, so an unset variable
+    became permission to reach anywhere.
+
+    Loopback used to be allowed wholesale. A canary gateway *is* loopback, but
+    so is every other local listener: another service on the machine, a proxy, a
+    developer's own tunnel. Same-origin already admits the canary, so the
+    exception bought nothing and gave away the rule.
     """
     if not per_turn_credential_required():
         return
     configured = _origin(os.environ.get("NEWAPI_BASE_URL", "").strip())
-    target = _origin(request_url)
-    if target is None or configured is None or target == configured:
-        return
-    # urlsplit().hostname, not netloc.split(":"): an IPv6 authority is
-    # bracketed, so splitting on the colon yields "[" and every loopback IPv6
-    # request would be refused.
-    host = (urlsplit(request_url).hostname or "").lower()
-    if host in _LOOPBACK:
-        return
-    raise ForeignModelEndpoint(
-        f"*** worker authenticates per turn and may only reach its configured "
-        f"gateway; refusing a request to {host}")
+    if configured is None:
+        raise GatewayConfigurationError(
+            "*** worker authenticates per turn but NEWAPI_BASE_URL names no "
+            "usable gateway; refusing to send anywhere")
+    if _origin(request_url) != configured:
+        host = (urlsplit(request_url).hostname or "unknown").lower()
+        raise ForeignModelEndpoint(
+            f"*** worker authenticates per turn and may only reach its "
+            f"configured gateway; refusing a request to {host}")
