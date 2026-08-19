@@ -47,6 +47,10 @@ _required: ContextVar[bool] = ContextVar(
     "hermes_gateway_credential_required", default=False)
 
 
+class ForeignModelEndpoint(RuntimeError):
+    """A per-turn worker tried to reach a host other than its gateway."""
+
+
 class MissingGatewayCredential(RuntimeError):
     """Raised instead of sending a request the host did not authorise.
 
@@ -170,6 +174,7 @@ def httpx_request_hook():
     """
 
     def _hook(request: Any) -> None:
+        refuse_foreign_endpoint(str(request.url))
         apply_to_headers(request.headers, str(request.url))
 
     return _hook
@@ -177,6 +182,40 @@ def httpx_request_hook():
 
 def async_httpx_request_hook():
     async def _hook(request: Any) -> None:
+        refuse_foreign_endpoint(str(request.url))
         apply_to_headers(request.headers, str(request.url))
 
     return _hook
+
+
+#: Hosts a per-turn worker may still reach: its own gateway, and loopback for a
+#: local tool or a test double. Everything else is refused before the body is
+#: written, because an unauthenticated request has still disclosed the prompt.
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def refuse_foreign_endpoint(request_url: str) -> None:
+    """Stop a per-turn worker from reaching any host but its gateway.
+
+    Confining the auxiliary fallback chain is the fix; this is the backstop for
+    it. The chain is one of several places that can pick a destination, and the
+    property being defended — this turn's prompt never leaves for a host the
+    operator did not authorise — should not depend on every one of them being
+    found. Refusing here is failure-closed at the last point where the request
+    still has not gone out.
+    """
+    if not per_turn_credential_required():
+        return
+    configured = _origin(os.environ.get("NEWAPI_BASE_URL", "").strip())
+    target = _origin(request_url)
+    if target is None or configured is None or target == configured:
+        return
+    # urlsplit().hostname, not netloc.split(":"): an IPv6 authority is
+    # bracketed, so splitting on the colon yields "[" and every loopback IPv6
+    # request would be refused.
+    host = (urlsplit(request_url).hostname or "").lower()
+    if host in _LOOPBACK:
+        return
+    raise ForeignModelEndpoint(
+        f"*** worker authenticates per turn and may only reach its configured "
+        f"gateway; refusing a request to {host}")
