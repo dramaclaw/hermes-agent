@@ -4000,12 +4000,28 @@ def _get_provider_chain() -> List[tuple]:
     provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
     a caller explicitly requests it with a model.
     """
-    return [
+    chain = [
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
         ("api-key", _resolve_api_key_provider),
     ]
+    # A worker that authenticates per turn has no standing credential of its
+    # own, so a fallback to a vendor is not a degraded answer — it is this
+    # turn's prompt leaving for a host the operator never authorised. That the
+    # call is unauthenticated makes it cheaper, not safer: the request body has
+    # already left. Under the latch the chain keeps only the configured
+    # gateway, and an auxiliary task that cannot be served there fails instead.
+    if _per_turn_credentials_required():
+        return [entry for entry in chain if entry[0] == "local/custom"]
+    return chain
+
+
+def _per_turn_credentials_required() -> bool:
+    """Whether this worker authenticates per turn rather than from its own env."""
+    return os.environ.get(
+        "DRAMACLAW_GATEWAY_CREDENTIAL_MODE", ""
+    ).strip().lower() == "per_turn_required"
 
 
 # ── Auxiliary "recently 402'd" unhealthy-provider cache ────────────────────
