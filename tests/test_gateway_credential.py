@@ -157,3 +157,105 @@ def test_the_capability_and_the_credential_are_independent() -> None:
     assert headers.get("Authorization") == "Bearer sk-org-B"
     with pytest.raises(credential_module.MissingGatewayCredential):
         _turn(None, True)
+
+
+# --- process-level latch ---------------------------------------------------
+#
+# The per-turn `required` flag only covers "the field was present and the value
+# was broken". The case that actually bites is a caller, a retry path or an
+# older client that omits _meta entirely: `required` is then False and the
+# request falls through to whatever key the worker was started with.
+
+@pytest.fixture
+def per_turn_worker(monkeypatch: pytest.MonkeyPatch):
+    """A worker started by a host that multiplexes tenants."""
+    monkeypatch.setenv(credential_module.CREDENTIAL_MODE_ENV,
+                       credential_module.PER_TURN_REQUIRED)
+    yield
+
+
+def test_a_missing_meta_block_cannot_fall_back_to_the_environment(per_turn_worker) -> None:
+    """The hole the required flag alone leaves open."""
+    credential, required = credential_module.parse_credential(None)
+    assert (credential, required) == (None, False), "no flag survives a missing _meta"
+    with pytest.raises(credential_module.MissingGatewayCredential):
+        _turn(credential, required)
+
+
+def test_an_absent_required_field_still_cannot_fall_back(per_turn_worker) -> None:
+    credential, required = credential_module.parse_credential({"unrelated": "value"})
+    assert (credential, required) == (None, False)
+    with pytest.raises(credential_module.MissingGatewayCredential):
+        _turn(credential, required)
+
+
+def test_a_realistic_environment_key_is_still_refused(
+    per_turn_worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A placeholder that looks like a real key must not become one."""
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("the request left the process without a turn credential")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler),
+        event_hooks={"request": [credential_module.httpx_request_hook()]},
+        headers={"Authorization": "Bearer sk-live-platform-0000000000000000"},
+    ) as client:
+        with credential_module.bound_credential(None, False):
+            with pytest.raises(credential_module.MissingGatewayCredential):
+                client.post(URL, json={"model": "m"})
+
+
+def test_the_placeholder_never_reaches_the_endpoint(per_turn_worker) -> None:
+    """The env key exists only so the SDK can construct a client."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Authorization"))
+        return httpx.Response(200, json={})
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler),
+        event_hooks={"request": [credential_module.httpx_request_hook()]},
+        headers={"Authorization": "Bearer dramaclaw-per-turn-placeholder"},
+    ) as client:
+        for key in ("sk-platform-P", "sk-org-A", "sk-org-B"):
+            with credential_module.bound_credential(key, True):
+                client.post(URL, json={"model": "m"})
+    assert seen == ["Bearer sk-platform-P", "Bearer sk-org-A", "Bearer sk-org-B"]
+    assert "dramaclaw-per-turn-placeholder" not in " ".join(filter(None, seen))
+
+
+def test_platform_and_org_keys_all_succeed_under_the_latch(per_turn_worker) -> None:
+    for key in ("sk-platform-P", "sk-org-A", "sk-org-B"):
+        assert _turn(key, True) == f"Bearer {key}"
+
+
+def test_plain_hermes_keeps_its_existing_behaviour(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the latch this is an ordinary Hermes and nothing changes."""
+    monkeypatch.delenv(credential_module.CREDENTIAL_MODE_ENV, raising=False)
+    assert credential_module.per_turn_credential_required() is False
+    assert _turn(None, False) == "Bearer PLATFORM-ENV-KEY"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [" sk-abc", "sk-abc ", "\tsk-abc", "sk-abc\n", "sk-abc\r\n", " sk-abc "],
+)
+def test_a_credential_needing_repair_is_refused_not_repaired(value: str) -> None:
+    """Silently trimming turns an illegal input into a legal-looking key.
+
+    " sk-abc" is not the key the host meant to send, and guessing which one it
+    meant is how a credential ends up subtly different on the two sides.
+    """
+    credential, _ = credential_module.parse_credential(
+        {credential_module.CREDENTIAL_META_KEY: value,
+         credential_module.CREDENTIAL_REQUIRED_META_KEY: True})
+    assert credential is None, f"{value!r} was repaired instead of refused"
+
+
+def test_a_clean_credential_is_taken_verbatim() -> None:
+    credential, required = credential_module.parse_credential(
+        {credential_module.CREDENTIAL_META_KEY: "sk-org-A",
+         credential_module.CREDENTIAL_REQUIRED_META_KEY: True})
+    assert (credential, required) == ("sk-org-A", True)
