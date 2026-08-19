@@ -186,6 +186,10 @@ def build_keepalive_http_client(
             async_httpx_request_hook,
             httpx_request_hook,
         )
+        from agent.gateway_credential import (
+            async_httpx_request_hook as async_credential_hook,
+            httpx_request_hook as credential_hook,
+        )
 
         transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
         client_cls = httpx.AsyncClient if async_mode else httpx.Client
@@ -193,8 +197,14 @@ def build_keepalive_http_client(
         # a default header would pin one turn's capability to every later
         # request. The hook reads the ContextVar at send time and therefore
         # sees the capability of whichever turn is making the call.
+        # Order matters only for readability; the two hooks touch different
+        # headers and carry opposite failure semantics. The credential hook may
+        # raise, which stops the request — that is deliberate.
         event_hooks = {
-            "request": [async_httpx_request_hook() if async_mode else httpx_request_hook()]
+            "request": [
+                async_httpx_request_hook() if async_mode else httpx_request_hook(),
+                async_credential_hook() if async_mode else credential_hook(),
+            ]
         }
         mounts = {}
         if proxy is None:
